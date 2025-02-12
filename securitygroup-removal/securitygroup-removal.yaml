@@ -1,21 +1,20 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  このテンプレートは、GuardDuty の所見が Security Hub にインポートされた後、
-  Security Hub の Finding イベント（aws.securityhub / "Security Hub Findings - Imported"）
-  をトリガーに、対象の EC2 または ECS(Fargate)
-  インスタンスに紐づくセキュリティグループの ingress/egress ルールを削除する
-  Step Functions 状態マシンを起動する仕組みを作成します。
-  ※ 必要に応じて IAM 権限やエラーハンドリングは調整してください。
+  このテンプレートは、Security Hub にインポートされた GuardDuty の所見をトリガーに、
+  対象の EC2 または ECS (Fargate) インスタンスに紐づくセキュリティグループの
+  ingress/egress ルールを削除する Step Functions 状態マシンを作成します.
+  Fargate 分岐では、タスクの Group フィールドからサービス名を抽出し、
+  ECS DescribeServices API によりサービスに紐づくセキュリティグループを動的に取得して
+  revoke を実施します.
 
 Resources:
 
-  ### Step Functions 実行用 IAM ロール
   StepFunctionsExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "StepFunctionsExecutionRole-${AWS::StackName}"
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -25,7 +24,7 @@ Resources:
       Policies:
         - PolicyName: StepFunctionsServiceIntegrationPolicy
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
@@ -35,9 +34,9 @@ Resources:
                   - ec2:RevokeSecurityGroupEgress
                   - ec2:DescribeNetworkInterfaces
                   - ecs:DescribeTasks
+                  - ecs:DescribeServices
                 Resource: "*"
 
-  ### Step Functions 状態マシン（EC2／Fargate 両対応）
   SecurityGroupRevocationStateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
@@ -45,21 +44,26 @@ Resources:
       RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
       DefinitionString: !Sub |
         {
-          "Comment": "Revoke security group rules for EC2 and ECS Fargate based on Security Hub findings",
+          "Comment": "Revoke security group rules for EC2 and Fargate tasks based on Security Hub findings",
           "StartAt": "CheckResourceType",
           "States": {
             "CheckResourceType": {
               "Type": "Choice",
               "Choices": [
                 {
-                  "Variable": "$.detail.resource.resourceType",
-                  "StringEquals": "Instance",
+                  "Variable": "$.detail.findings[0].Resources[0].Type",
+                  "StringEquals": "AwsEc2Instance",
                   "Next": "EC2_DescribeInstance"
                 },
                 {
-                  "Variable": "$.detail.resource.resourceType",
-                  "StringEquals": "ECSCluster",
-                  "Next": "Fargate_DescribeTask"
+                  "Variable": "$.detail.findings[0].Resources[0].Type",
+                  "StringEquals": "AwsEcsTask",
+                  "Next": "Fargate_SelectTask"
+                },
+                {
+                  "Variable": "$.detail.findings[0].Resources[1].Type",
+                  "StringEquals": "AwsEcsTask",
+                  "Next": "Fargate_SelectTask"
                 }
               ],
               "Default": "UnsupportedResource"
@@ -69,11 +73,12 @@ Resources:
               "Error": "UnsupportedResourceType",
               "Cause": "The resource type is not supported."
             },
+
             "EC2_DescribeInstance": {
               "Type": "Task",
               "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
               "Parameters": {
-                "InstanceIds.$": "States.Array($.detail.resource.instanceDetails.instanceId)"
+                "InstanceIds.$": "States.Array(States.ArrayGetItem(States.StringSplit($.detail.findings[0].Resources[0].Id, '/'), 1))"
               },
               "ResultPath": "$.EC2Instance",
               "Next": "EC2_ExtractSG"
@@ -96,7 +101,7 @@ Resources:
                   "EC2_TransformItem": {
                     "Type": "Pass",
                     "Parameters": {
-                      "transformed.groupId.$": "$.GroupId"
+                      "groupId.$": "$.GroupId"
                     },
                     "ResultPath": "$",
                     "Next": "EC2_SG_Describe"
@@ -160,7 +165,7 @@ Resources:
                             "Type": "Task",
                             "Resource": "arn:aws:states:::aws-sdk:ec2:revokeSecurityGroupEgress",
                             "Parameters": {
-                              "GroupId.$": "$.groupId",
+                              "GroupId.$": "$.groupid",
                               "IpPermissions.$": "$.SGDetails.SecurityGroups[0].IpPermissionsEgress"
                             },
                             "End": true
@@ -181,44 +186,56 @@ Resources:
             "EC2_Done": {
               "Type": "Succeed"
             },
+
+            "Fargate_SelectTask": {
+              "Type": "Pass",
+              "Parameters": {
+                "ClusterArn.$": "$.detail.findings[0].Resources[0].Details.AwsEcsCluster.ClusterArn",
+                "TaskId.$": "$.detail.findings[0].Resources[1].Id"
+              },
+              "ResultPath": "$.selectedTask",
+              "Next": "Fargate_DescribeTask"
+            },
             "Fargate_DescribeTask": {
               "Type": "Task",
               "Resource": "arn:aws:states:::aws-sdk:ecs:describeTasks",
               "Parameters": {
-                "Cluster.$": "$.detail.resource.ecsClusterDetails.name",
-                "Tasks.$": "States.Array($.detail.resource.ecsClusterDetails.taskDetails.arn)"
+                "Cluster.$": "$.selectedTask.ClusterArn",
+                "Tasks.$": "States.Array($.selectedTask.TaskId)"
               },
               "ResultPath": "$.FargateTask",
-              "Next": "Fargate_ExtractENI"
+              "Next": "Fargate_ExtractServiceName"
             },
-            "Fargate_ExtractENI": {
+            "Fargate_ExtractServiceName": {
               "Type": "Pass",
               "Parameters": {
-                "eniIds.$": "$.FargateTask.tasks[0].attachments[*].details[?(@.name=='networkInterfaceId')].value"
+                "serviceName.$": "States.ArrayGetItem(States.StringSplit($.FargateTask.Tasks[0].Group, ':'), 1)",
+                "ClusterArn.$": "$.selectedTask.ClusterArn"
               },
-              "ResultPath": "$.ENI",
-              "Next": "Fargate_DescribeENI"
+              "ResultPath": "$.extractedService",
+              "Next": "Fargate_DescribeService"
             },
-            "Fargate_DescribeENI": {
+            "Fargate_DescribeService": {
               "Type": "Task",
-              "Resource": "arn:aws:states:::aws-sdk:ec2:describeNetworkInterfaces",
+              "Resource": "arn:aws:states:::aws-sdk:ecs:describeServices",
               "Parameters": {
-                "NetworkInterfaceIds.$": "$.ENI.eniIds"
+                "Cluster.$": "$.extractedService.ClusterArn",
+                "Services.$": "States.Array($.extractedService.serviceName)"
               },
-              "ResultPath": "$.ENI_Desc",
-              "Next": "Fargate_ExtractSG"
+              "ResultPath": "$.serviceDetails",
+              "Next": "Fargate_ExtractServiceSG"
             },
-            "Fargate_ExtractSG": {
+            "Fargate_ExtractServiceSG": {
               "Type": "Pass",
               "Parameters": {
-                "securityGroupObjects.$": "$.ENI_Desc.NetworkInterfaces[0].Groups"
+                "securityGroupObjects.$": "$.serviceDetails.services[0].networkConfiguration.awsvpcConfiguration.securityGroups"
               },
               "ResultPath": "$.extractedSG",
               "Next": "Fargate_ProcessSG"
             },
             "Fargate_ProcessSG": {
               "Type": "Map",
-              "ItemsPath": "$.extractedSG.securityGroupObjects",
+              "ItemsPath": "$.extractedSG",
               "ResultPath": "$.Fargate_SG_Results",
               "Iterator": {
                 "StartAt": "Fargate_TransformItem",
@@ -226,7 +243,7 @@ Resources:
                   "Fargate_TransformItem": {
                     "Type": "Pass",
                     "Parameters": {
-                      "groupId.$": "$.GroupId"
+                      "groupId.$": "$$.Map.Item.Value"
                     },
                     "ResultPath": "$",
                     "Next": "Fargate_SG_Describe"
@@ -261,7 +278,7 @@ Resources:
                             "Type": "Task",
                             "Resource": "arn:aws:states:::aws-sdk:ec2:revokeSecurityGroupIngress",
                             "Parameters": {
-                              "GroupId.$": "$.groupId",
+                              "GroupId.$": "$.groupid",
                               "IpPermissions.$": "$.SGDetails.SecurityGroups[0].IpPermissions"
                             },
                             "End": true
@@ -290,7 +307,7 @@ Resources:
                             "Type": "Task",
                             "Resource": "arn:aws:states:::aws-sdk:ec2:revokeSecurityGroupEgress",
                             "Parameters": {
-                              "GroupId.$": "$.groupId",
+                              "GroupId.$": "$.groupid",
                               "IpPermissions.$": "$.SGDetails.SecurityGroups[0].IpPermissionsEgress"
                             },
                             "End": true
@@ -314,13 +331,12 @@ Resources:
           }
         }
   
-  ### EventBridge から Step Functions を起動するための IAM ロール
   EventBridgeStepFunctionsRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "EventBridgeStepFunctionsRole-${AWS::StackName}"
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -330,34 +346,32 @@ Resources:
       Policies:
         - PolicyName: "AllowStartExecution"
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
                   - states:StartExecution
                 Resource: !GetAtt SecurityGroupRevocationStateMachine.Arn
-
-SecurityHubEventRule:
-  Type: AWS::Events::Rule
-  Properties:
-    Name: !Sub "SecurityHubToStepFunctions-${AWS::StackName}"
-    EventPattern:
-      source:
-        - "aws.securityhub"
-      detail-type:
-        - "Security Hub Findings - Imported"
-      detail:
-        ProductArn:
-          - "arn:aws:securityhub:*:aws:product/aws/guardduty"
-        Severity:
-          Label:
-            - "CRITICAL"
-            - "HIGH"
-    Targets:
-      - Arn: !GetAtt SecurityGroupRevocationStateMachine.Arn
-        Id: "TargetStateMachine"
-        RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
-
+  
+  SecurityHubEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "SecurityHubToStepFunctions-${AWS::StackName}"
+      EventPattern:
+        source:
+          - "aws.securityhub"
+        detail:
+          findings:
+            ProductName:
+              - "GuardDuty"
+            Severity:
+              Label:
+                - "CRITICAL"
+                - "HIGH"
+      Targets:
+        - Arn: !GetAtt SecurityGroupRevocationStateMachine.Arn
+          Id: "TargetStateMachine"
+          RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
 
 Outputs:
   SecurityGroupRevocationStateMachineArn:
@@ -369,6 +383,3 @@ Outputs:
   EventBridgeStepFunctionsRoleArn:
     Description: "ARN of the IAM Role for EventBridge to start the state machine"
     Value: !GetAtt EventBridgeStepFunctionsRole.Arn
-  GuardDutyEventRuleArn:
-    Description: "ARN of the EventBridge Rule triggering the state machine"
-    Value: !GetAtt GuardDutyEventRule.Arn
