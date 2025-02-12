@@ -1,0 +1,1069 @@
+# Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# MIT No Attribution
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Example of using AWS Network Firewall for automatic blocking of
+  suspicious traffic detected by GuardDuty. '
+
+Parameters:
+  Retention:
+    Description: How long to retain IP addresses in the blocklist (in minutes).
+      Default is 12 hours, minimum is 5 minutes and maximum one week (10080
+      minutes)
+    Type: Number
+    Default: 720
+    MinValue: 5
+    MaxValue: 10080
+    ConstraintDescription: Minimum of 5 minutes and maximum of 10080 (one week).
+  AdminEmail:
+    Description: Email address to receive notifications. Must be a valid email address.
+    Type: String
+    AllowedPattern: ^(?:[a-z0-9!#$%&'*+\/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+\/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])$
+  RulegroupPriority:
+    Description: Priority for rules created by this solution within AWS Network
+      Firewall's Rule Group.
+    Type: Number
+    Default: 30000
+    MinValue: 1
+    MaxValue: 65535
+    ConstraintDescription: Valid Range - minimum value of 1, maximum value of 65535
+  RulegroupCapacity:
+    Description: Capacity for a created rule group.  Each block rule takes 2 units
+      of capacity.  Only used if creating a new rule grop
+      (ExistingRuleGroup=False).
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    MaxValue: 10000
+    ConstraintDescription: Valid Range - minimum value of 100, maximum value of 10000.
+  PruningFrequency:
+    Description: How often (how many minutes apart) the pruning check gets
+      executed.  The default is every 15 minutes.
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 180
+    ConstraintDescription: Valid Range - minimum value of 5, maximum value of 180.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: GuardDuty to Network Firewall Configuration
+        Parameters:
+          - AdminEmail
+          - RulegroupCapacity
+          - RulegroupPriority
+          - Retention
+          - PruningFrequency
+      - Label:
+          default: Artifact Configuration
+        Parameters:
+          - ArtifactsBucket
+          - ArtifactsPrefix
+
+    ParameterLabels:
+      AdminEmail:
+        default: Notification email (REQUIRED)
+      Retention:
+        default: Retention time in minutes
+      ArtifactsBucket:
+        default: S3 bucket for artifacts
+      ArtifactsPrefix:
+        default: S3 path to artifacts
+
+Resources:
+
+  ##########################################################################
+  #                                                                        #
+  # Common Resources Section                                               #
+  #                                                                        #
+  ##########################################################################
+
+
+  #AWS Network Firewall Rule Group that will be managed by this solution.  
+  #This Rule Group can be used across multiple Network Firewall Policies
+  GuardDutytoFirewallRulegroup:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Properties:
+      RuleGroupName: !Sub ${AWS::StackName}-BlockList
+      Type: STATELESS
+      Capacity: !Ref RulegroupCapacity
+      Description: Rulegroup managed by GuardDuty-to-NetworkFirewall solution
+      Tags:
+        - Key: ManagedBy
+          Value: GuardDutytoFirewallSolution
+      RuleGroup:
+        RulesSource:
+          StatelessRulesAndCustomActions:
+            CustomActions:
+              - ActionName: GuardDutytoFirewall
+                ActionDefinition:
+                  PublishMetricAction:
+                    Dimensions:
+                      - Value: !Sub ${AWS::StackName}
+            StatelessRules:
+              - RuleDefinition:
+                  MatchAttributes:
+                    Destinations:
+                      - AddressDefinition: 127.0.0.1/32
+                  Actions:
+                    - aws:drop
+                Priority: !Ref RulegroupPriority
+
+  # DynamoDB table that holds data about remediations taken, 
+  # including IP addresses of suspicious hosts and timestamps of GuardDuty findings.
+  # This data helps with periodic pruning to remove stale rules from AWS Network Firewall.
+  GuardDutytoFirewallDDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: HostIp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: HostIp
+          KeyType: HASH
+
+  # SNS topic used for sending messages to admins
+  GuardDutyToFirewallSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref AdminEmail
+          Protocol: email
+
+  # Lambda function that blocks suspicious remote hosts
+  # by updating a RuleGroup for the AWS Network Firewall 
+  UpdateNetworkFirewallRuleGroupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt UpdateNetworkFirewallRuleGroupLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Environment:
+        Variables:
+          FIREWALLRULEGROUP: !Ref GuardDutytoFirewallRulegroup
+          RULEGROUPPRI: !Ref RulegroupPriority
+          CUSTOMACTIONNAME: GuardDutytoFirewall
+          CUSTOMACTIONVALUE: !Sub ${AWS::StackName}
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import os, json, logging
+          import boto3
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          #
+          RuleGroupArn = os.environ['FIREWALLRULEGROUP']
+          RuleGroupPriority = os.environ['RULEGROUPPRI']
+          CustomActionName =  os.environ['CUSTOMACTIONNAME']
+          CustomActionValue =  os.environ['CUSTOMACTIONVALUE']
+          #
+          #
+          #
+          def create_sources(block_list):
+              response = []
+              for i in block_list:
+                  response.append({'AddressDefinition': str(i['IP']) + '/32' })
+              return response
+          #
+          def get_rg_config():
+              client = boto3.client('network-firewall')
+              response = client.describe_rule_group(
+                  RuleGroupArn=RuleGroupArn,
+                  Type='STATELESS'
+              )
+              return response
+          #
+          def update_rg_config(block_list):
+              client = boto3.client('network-firewall')
+              currgconfig = get_rg_config()
+              RuleGroupPriorityDst = int(RuleGroupPriority) + 100
+              #Create new rule from dictionary of IPs CIDRS to block
+              newrules = [
+                  {
+                  'RuleDefinition': {
+                      'MatchAttributes': {
+                          'Sources': create_sources(block_list)
+                      },
+                      'Actions': [
+                          'aws:drop',
+                          CustomActionName
+                      ]
+                  },
+                  'Priority': int(RuleGroupPriority)
+                  },
+                  {
+                  'RuleDefinition': {
+                      'MatchAttributes': {
+                          'Destinations': create_sources(block_list)
+                      },
+                      'Actions': [
+                          'aws:drop',
+                          CustomActionName
+                      ]
+                  },
+                  'Priority': int(RuleGroupPriorityDst)
+                  }
+              ]
+              # Custom Actions provide CloudWatch metrics
+              customactions = [
+                  {
+                      'ActionName': CustomActionName,
+                      'ActionDefinition': {
+                          'PublishMetricAction': {
+                              'Dimensions': [
+                                  {
+                                      'Value': CustomActionValue
+                                  }
+                              ]
+                          }
+                      }
+                  }
+              ]
+              # Preserve current rules not used here in rule group by appending to new rule
+              newrgconfig = currgconfig['RuleGroup']['RulesSource']['StatelessRulesAndCustomActions']['StatelessRules']
+              try:
+                for r in newrgconfig:
+                    if int(r['Priority']) not in [ int(RuleGroupPriority), int(RuleGroupPriorityDst) ]:
+                        newrules.append(r)
+                #Update the rule group
+                logger.info("Update Rule Group ARN, %s." % RuleGroupArn)
+                response = client.update_rule_group(
+                    UpdateToken=currgconfig['UpdateToken'],
+                    RuleGroupArn=RuleGroupArn,
+                    RuleGroup={
+                        'RulesSource': {
+                            'StatelessRulesAndCustomActions': {
+                                'StatelessRules':
+                                    newrules,
+                                'CustomActions':
+                                    customactions
+                            }
+                        }
+                    },
+                    Type='STATELESS',
+                    Description='GD2NFW Blog Sample',
+                    DryRun=False
+                )
+              except Exception as e:
+                logger.error('something went wrong')
+                raise
+          #
+          #
+          #
+          # Lambda handler
+          def handler(event, context):
+              logger.info("log -- Event: %s " % json.dumps(event))
+              # retrieve a list of IPs delivered from the previous step in the State Machine
+              block_list = event['IPList']
+              #if empty, provide a fake entry - rule group update requires at least one entry
+              if len(block_list) == 0:
+                block_list = [{'IP':'127.0.0.1'}]
+              # update the AWS Network Firewall Rule Group
+              # replace with the updated list of IPs
+              update_rg_config(block_list)
+              #
+              # check if the function was called for blocking or pruning
+              if ('HostIp' in event):
+                  # blocking completed, pass the data on to the next step
+                  return {
+                      "HostIp": event['HostIp'],
+                      "FindingId": event['FindingId'],
+                      "Timestamp": event['Timestamp'],
+                      "AccountId": event['AccountId'],
+                      "Region": event['Region']
+                  }
+              else:
+                  # this was a pruning action
+                  return {
+                    "PruningSuccessful": True
+                  }
+
+  # Permissions for the Lambda function to interact with 
+  # AWS Network Firewall service to update a RuleGroup
+  UpdateNetworkFirewallRuleGroupLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UpdateNetworkFirewallRuleGroupLambdaExecutionRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - network-firewall:DescribeRuleGroup
+                  - network-firewall:UpdateRuleGroup
+                Resource: !Ref GuardDutytoFirewallRulegroup
+
+  ##########################################################################
+  #                                                                        #
+  # Blocking / Protection Section                                          #
+  #                                                                        #
+  ##########################################################################
+
+
+  # state machine that orchestrates Lambda functions to block traffic and record 
+  # data in the table, sends notifications on failure at any step or success
+  # of the whole workflow
+  GuardDutytoFirewallStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt GuardDutytoFirewallStateMachineExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "Record IP in DB",
+          "Comment": "Triggered by GuardDuty finding, checks if remote IP is identified, then blocks traffic to that IP",
+          "States": {
+            "Record IP in DB": {
+              "Type": "Task",
+              "Resource": "${GuardDutytoFirewallRecordLambdaFunction.Arn}",
+              "Parameters": {
+                "comment": "Relevant fields from the GuardDuty / Security Hub finding",
+                "HostIp.$": "$.detail.findings[0].ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4",
+                "Timestamp.$": "$.detail.findings[0].ProductFields.aws/guardduty/service/eventLastSeen",
+                "FindingId.$": "$.id",
+                "AccountId.$": "$.account",
+                "Region.$": "$.region"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "Notify Failure"
+                }
+              ],
+              "Next": "New IP?"
+            },
+            "New IP?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.NewIP",
+                  "BooleanEquals": true,
+                  "Next": "Block Traffic"
+                }
+              ],
+              "Default": "No Firewall Change"
+            },
+            "No Firewall Change": {
+              "Type": "Succeed"
+            },
+            "Block Traffic": {
+              "Type": "Task",
+              "Resource": "${UpdateNetworkFirewallRuleGroupFunction.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "Notify Failure"
+                }
+              ],
+              "Next": "Notify Success"
+            },
+            "Notify Success": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "Message": {
+                  "Blocked": "true",
+                  "Input.$": "$"
+                },
+                "TopicArn": "${GuardDutyToFirewallSNSTopic}"
+              },
+              "End": true
+            },
+            "Notify Failure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "Message": {
+                  "Blocked": "false",
+                  "Input.$": "$"
+                },
+                "TopicArn": "${GuardDutyToFirewallSNSTopic}"
+              },
+              "End": true
+            }
+          }
+        }
+
+  # permissions for state machine to invoke Lambda functions it's orchestrating
+  # and to send notification messages to the SNS topic
+  GuardDutytoFirewallStateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: GuardDutytoFirewallStateMachineExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt GuardDutytoFirewallRecordLambdaFunction.Arn
+                  - !GetAtt UpdateNetworkFirewallRuleGroupFunction.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref GuardDutyToFirewallSNSTopic
+
+  # EventBridge Event Rule - For Security Hub event published to EventBridge:
+  GuardDutytoFirewallStateMachineEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Security Hub - GuardDuty findings with remote IP
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail:
+          findings:
+            ProductFields:
+              aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4:
+                - exists: true
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt GuardDutytoFirewallStateMachine.Arn
+          RoleArn: !GetAtt GuardDutytoFirewallStateMachineEventRole.Arn
+          Id: GuardDutyEvent-StepFunctions-Trigger
+
+  # permissions for EventBridge to invoke the state machine
+  GuardDutytoFirewallStateMachineEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GuardDutytoFirewallStateMachineStartExecution
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !GetAtt GuardDutytoFirewallStateMachine.Arn
+
+  # records new entries in DynamoDB table, including IP addresses of suspicous hosts and timestamps
+  # recording this data helps with pruning and removing of old entries
+  GuardDutytoFirewallRecordLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt GuardDutytoFirewallRecordLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Environment:
+        Variables:
+          ACLMETATABLE: !Ref GuardDutytoFirewallDDBTable
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json, os, boto3, logging
+          import dateutil.parser
+          from boto3.dynamodb.conditions import Key, Attr
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          #======================================================================================================================
+          # Variables
+          #======================================================================================================================
+          ACLMETATABLE = os.environ['ACLMETATABLE']
+          ddb = boto3.resource('dynamodb')
+          table = ddb.Table(ACLMETATABLE)
+          #======================================================================================================================
+          # Functions
+          #======================================================================================================================
+          #
+          # Converts from ISO 8601 to Unix Epoch time
+          def convert_to_epoch(Timestamp):
+              parsed_t = dateutil.parser.parse(Timestamp)
+              t_in_seconds = parsed_t.strftime('%s')
+              print (t_in_seconds)
+              return (t_in_seconds)
+          #
+          # Creates a new DynamoDB item recording the IP, timestamp and other details
+          def create_ddb_rule(record):
+              ddb = boto3.resource('dynamodb')
+              table = ddb.Table(ACLMETATABLE)
+              response = table.put_item(
+                  Item=record,
+                  ReturnValues='ALL_OLD'
+                  )
+              if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                  if 'Attributes' in response:
+                      logger.info("updated existing record, no new IP")
+                      return False
+                  else:
+                      logger.info("log -- successfully added DDB state entry %s" % (record))
+                      return True
+              else:
+                  logger.error("log -- error adding DDB state entry for %s" % (record))
+                  logger.info(response)
+                  raise
+          #
+          # gets all IPs in the DynamoDB table
+          def getAllIPs():
+              Return_JSON = {}
+              IPList = []
+              try:
+                  #scan the ddb table to find expired records
+                  response = table.scan()
+                  # if any records are found:
+                  if response['Items']:
+                      logger.info("log -- found records")
+                      # process each expired record, append to list
+                      for item in response['Items']:
+                          logger.info("HostIp %s" %item['HostIp'])
+                          IPList.append({"IP": item['HostIp']})
+                  else:
+                      logger.info("log -- no entries found.")
+              except Exception as e:
+                  logger.error('something went wrong')
+                  raise
+              # respond with a list of all IPs in DynamoDB table
+              return IPList
+          #
+          #
+          #======================================================================================================================
+          # Lambda Entry Point
+          #======================================================================================================================
+          #
+          # Lambda handler
+          def handler(event, context):
+              logger.info("log -- Event: %s " % json.dumps(event))
+              # using epoch time (counted in seconds) to evaluate expiration
+              epoch_time = convert_to_epoch(str(event['Timestamp']))
+              # format a new record to be added to DynamoDB table
+              record = {
+                  'HostIp': str(event['HostIp']),
+                  'Timestamp': str(event['Timestamp']),
+                  'CreatedAt': int(epoch_time),
+                  'FindingId': str(event['FindingId']),
+                  'AccountId': str(event['AccountId']),
+                  'Region': str(event['Region'])
+                  }
+              result = create_ddb_rule(record)
+              if (result==True):
+                  record['IPList'] = getAllIPs()
+                  record['NewIP'] = True
+              else:
+                  record['NewIP'] = False
+              # send data back to StepFunctions for the next step in the workflow
+              return record
+
+  # Permissions for Lambda function to update the DynamoDB table
+  GuardDutytoFirewallRecordLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GuardDutytoFirewallRecordLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt GuardDutytoFirewallDDBTable.Arn
+
+  ##########################################################################
+  ##########################################################################
+  ##                                                                      ##
+  ##  Pruning Section                                                     ##
+  ##                                                                      ##
+  ##########################################################################
+  ##########################################################################  
+
+
+  # periodic pruning of old firewall rules and table records
+  PruningStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt PruningStateMachineExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "Get Expired Records from DynamoDB",
+          "Comment": "Triggered by GuardDuty finding, checks if remote IP is identified, then blocks traffic to that IP",
+          "States": {
+            "Get Expired Records from DynamoDB": {
+              "Type": "Task",
+              "Resource": "${PruneGetExpiredIPsLambdaFunction.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Parameters": {
+                "comment": "Retrieve expired records from the DynamoDB table"
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "Notify Failure to Get Expired IPs"
+                }
+              ],
+              "Next": "Is Pruning Needed?"
+            },
+            "Is Pruning Needed?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.PruningNeeded",
+                  "BooleanEquals": true,
+                  "Next": "Remove Records from DynamoDB"
+                }
+              ],
+              "Default": "No Pruning Needed"
+            },
+            "Remove Records from DynamoDB": {
+              "Type": "Task",
+              "Resource": "${PruneRecordsLambdaFunction.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "Notify Failure"
+                }
+              ],
+              "Next": "Remove IPs from Firewall"
+            },
+            "Remove IPs from Firewall": {
+              "Type": "Task",
+              "Resource": "${UpdateNetworkFirewallRuleGroupFunction.Arn}",
+              "Parameters": {
+                "IPList.$": "$.IPList",
+                "comment": "Overwrites the RuleGrop with the updated list with expired IPs removed"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "Notify Failure"
+                }
+              ],
+              "Next": "Pruning Completed"
+            },
+            "Notify Failure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "Message": {
+                  "Message": "Pruning Failed",
+                  "Input.$": "$"
+                },
+                "TopicArn": "${GuardDutyToFirewallSNSTopic}"
+              },
+              "End": true
+            },
+            "Notify Failure to Get Expired IPs": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "Message": {
+                  "Message": "Pruning Failed - could not get expired IPs",
+                  "Input.$": "$"
+                },
+                "TopicArn": "${GuardDutyToFirewallSNSTopic}"
+              },
+              "End": true
+            },
+            "Pruning Completed": {
+              "Type": "Succeed"
+            },
+            "No Pruning Needed": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+  # permissions for the pruning state machine to invoke Lambda functions
+  # and send messages to the SNS topic
+  PruningStateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: PruningStateMachineExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt PruneGetExpiredIPsLambdaFunction.Arn
+                  - !GetAtt UpdateNetworkFirewallRuleGroupFunction.Arn
+                  - !GetAtt PruneRecordsLambdaFunction.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref GuardDutyToFirewallSNSTopic
+
+  # Scheduled trigger for pruning of AWS Network Firewall rules and DynamoDB records
+  PruneOldEntriesSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ScheduledPruningRule
+      ScheduleExpression: !Sub rate(${PruningFrequency} minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PruningStateMachine.Arn
+          RoleArn: !GetAtt PruningStateMachineEventRole.Arn
+          Id: Pruning-StepFunctions-Schedule
+
+  # gives EventBridge permission to invoke the pruning state machine
+  PruningStateMachineEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PruningStateMachineStartExecution
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !GetAtt PruningStateMachine.Arn
+
+  # Checks DynamoDB table for expired records that need to be pruned
+  PruneGetExpiredIPsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt PruneGetExpiredIPsLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Environment:
+        Variables:
+          ACLMETATABLE: !Ref GuardDutytoFirewallDDBTable
+          RETENTION: !Ref Retention
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import os, boto3, logging, json, time
+          from boto3.dynamodb.conditions import Key, Attr
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          #======================================================================================================================
+          # Variables
+          #======================================================================================================================
+          ACLMETATABLE = os.environ['ACLMETATABLE']
+          RETENTION = os.environ['RETENTION']
+          ddb = boto3.resource('dynamodb')
+          table = ddb.Table(ACLMETATABLE)
+          #======================================================================================================================
+          # Functions
+          #======================================================================================================================
+          #
+          def getExpiredIPs(expire_time):
+              Return_JSON = {}
+              ExpiredIPList = []
+              try:
+                  #scan the ddb table to find expired records
+                  response = table.scan(FilterExpression=Attr('CreatedAt').lt(expire_time))
+                  # if expired records are found:
+                  if response['Items']:
+                      logger.info("log -- found expired entries, %s." % (response)['Items'])
+                      Return_JSON['PruningNeeded'] = True
+                      # process each expired record, append to list
+                      for item in response['Items']:
+                          logger.info("HostIp %s" %item['HostIp'])
+                          ExpiredIPList.append({"IP": item['HostIp']})
+                  else:
+                      logger.info("log -- no entries older than %s minutes found." % (int(RETENTION)))
+                      Return_JSON['PruningNeeded'] = False
+              except Exception as e:
+                  logger.error('something went wrong')
+                  raise
+              # return nested JSON with a list of IPs
+              Return_JSON['ExpiredIPList'] = ExpiredIPList
+              return Return_JSON
+          #======================================================================================================================
+          # Lambda Entry Point
+          #======================================================================================================================
+          #
+          # Lambda handler
+          def handler(event, context):
+            logger.info("log -- Event: %s " % json.dumps(event))
+            # records older than this time stamp should be pruned
+            expire_time = int(time.time()) - (int(RETENTION)*60)
+            logger.info("log -- expire_time = %s" % expire_time)
+            response = getExpiredIPs(expire_time)
+            return response
+
+  # permissions to remove old records from DynamoDB table
+  PruneGetExpiredIPsLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PruneGetExpiredIPsLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt GuardDutytoFirewallDDBTable.Arn
+
+  # removes old records from the DynamoDB table
+  PruneRecordsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt PruneRecordsLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Environment:
+        Variables:
+          ACLMETATABLE: !Ref GuardDutytoFirewallDDBTable
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import os, boto3, logging, json
+          from boto3.dynamodb.conditions import Key, Attr
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          #
+          #======================================================================================================================
+          # Variables
+          #======================================================================================================================
+          ACLMETATABLE = os.environ['ACLMETATABLE']
+          ddb = boto3.resource('dynamodb')
+          table = ddb.Table(ACLMETATABLE)
+          #
+          #======================================================================================================================
+          # Functions
+          #======================================================================================================================
+          #
+          # deletes all records matching the IP list
+          def Delete_DynamoDB_Items(IPList):
+              ddb = boto3.resource('dynamodb')
+              table = ddb.Table(ACLMETATABLE)
+              for IP in IPList:
+                  response = table.delete_item(
+                      Key={
+                          'HostIp': IP['IP']
+                          }
+                      )
+                  if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                      logger.info('log -- Delete_DynamoDB_Item successful')
+                      return True
+                  else:
+                      logger.error('log -- Delete_DynamoDB_Item FAILED')
+                      logger.info(response['ResponseMetadata'])
+          #
+          # gets all IPs in the DynamoDB table
+          def getAllIPs():
+              IPList = []
+              try:
+                  #scan the ddb table to find expired records
+                  response = table.scan()
+                  # if any records are found:
+                  if response['Items']:
+                      logger.info("log -- found records")
+                      # process each expired record, append to list
+                      for item in response['Items']:
+                          logger.info("HostIp %s" %item['HostIp'])
+                          IPList.append({"IP": item['HostIp']})
+                  else:
+                      logger.info("log -- no entries found.")
+              except Exception as e:
+                  logger.error('something went wrong')
+                  raise
+              # respond with a list of all IPs in DynamoDB table
+              return IPList
+          #
+          #======================================================================================================================
+          # Lambda Entry Point
+          #======================================================================================================================
+          #
+          # Lambda handler
+          def handler(event, context):
+              logger.info("log -- Event: %s " % json.dumps(event))
+              # get the IP address to be removed from DynamoDB
+              IPList = event['ExpiredIPList']
+              logger.info("log -- removing IP addresses %s" % IPList)
+              # delete expired IPs
+              Delete_DynamoDB_Items(IPList)
+              # retrieve IP addresses that need to be still in the rule group
+              json_response = {}
+              json_response['IPList'] = getAllIPs()
+              return json_response
+
+  # permissions to remove old records from DynamoDB table
+  PruneRecordsLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PruneRecordsLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt GuardDutytoFirewallDDBTable.Arn
+
+Outputs:
+  GuardDutytoFirewallStateMachine:
+    Description: Step Functions State Machine orchestrating blocking of traffic and
+      adding new rules to the AWS Network Firewall rule group
+    Value: !Sub https://console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${GuardDutytoFirewallStateMachine}
+  RuleGroupArn:
+    Description: Stateless AWS Network Firewall Rule Group ARN that is managed by
+      this solution
+    Value: !Ref GuardDutytoFirewallRulegroup
