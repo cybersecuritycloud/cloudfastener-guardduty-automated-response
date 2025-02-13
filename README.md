@@ -26,3 +26,46 @@
 
 ## デプロイ方法
 各ディレクトリにある `deployment-guide.md` を参照してください。
+
+## アーキテクチャ図
+```mermaid
+flowchart TD
+    A[Security Hub<br/>(GuardDuty Findings<br/>インポート済み)]
+    B[EventBridge ルール]
+    C[Step Functions<br/>State Machine]
+    D{リソースタイプ判定}
+    E[SecurityGroupRevokerFunctionEC2<br/>(Lambda)]
+    F[SecurityGroupRevokerFunctionFargate<br/>(Lambda)]
+    G[EC2 / ECS API<br/>Describe & Revoke SG Rules]
+
+    A --> B
+    B --> C
+    C --> D
+    D -- "AwsEc2Instance" --> E
+    D -- "AwsEcsTask" --> F
+    E --> G
+    F --> G
+```
+
+```
+
+```
+
+## ワークフロー図
+
+```mermaid
+flowchart TD
+    Start[開始]
+    Check[リソースタイプ判定]
+    EC2[EC2の場合:<br/>SecurityGroupRevokerFunctionEC2 を呼び出し]
+    Fargate[Fargateの場合:<br/>SecurityGroupRevokerFunctionFargate を呼び出し]
+    End[処理完了]
+
+    Start --> Check
+    Check -- "AwsEc2Instance" --> EC2
+    Check -- "AwsEcsTask" --> Fargate
+    EC2 --> End
+    Fargate --> End
+
+
+```
