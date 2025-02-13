@@ -30,13 +30,13 @@
 ## アーキテクチャ図
 ```mermaid
 flowchart TD
-    A[Security Hub\n(GuardDuty Findings)]
-    B[EventBridge Rule]
-    C[Step Functions\nState Machine]
-    D{Resource Type?}
-    E[SecurityGroupRevokerFunctionEC2\n(Lambda)]
-    F[SecurityGroupRevokerFunctionFargate\n(Lambda)]
-    G[EC2/ECS API\nDescribe & Revoke SG Rules]
+    A["Security Hub (GuardDuty Findings)"]
+    B["EventBridge Rule"]
+    C["Step Functions State Machine"]
+    D{"Resource Type?"}
+    E["SecurityGroupRevokerFunctionEC2 (Lambda)"]
+    F["SecurityGroupRevokerFunctionFargate (Lambda)"]
+    G["EC2/ECS API: Describe & Revoke SG Rules"]
 
     A --> B
     B --> C
@@ -45,6 +45,7 @@ flowchart TD
     D -- "AwsEcsTask" --> F
     E --> G
     F --> G
+
 
 ```
 
