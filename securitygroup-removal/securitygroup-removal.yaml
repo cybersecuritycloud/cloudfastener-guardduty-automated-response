@@ -4,12 +4,6 @@ Description: >
   対象の EC2 または ECS (Fargate) インスタンスに紐づくセキュリティグループの ingress/egress ルールを削除する仕組みを作成します。
   EC2の場合は Lambda 関数 (SecurityGroupRevokerFunctionEC2) が、Fargateの場合は Lambda 関数 (SecurityGroupRevokerFunctionFargate) が実行されます。
 
-Parameters:
-  UpdateToken:
-    Type: String
-    Default: "initial"
-    Description: "Dummy parameter to force stack update"
-
 Resources:
 
   ## Step Functions 用実行ロール
