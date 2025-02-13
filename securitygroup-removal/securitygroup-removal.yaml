@@ -1,28 +1,32 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  このテンプレートは、Security Hub にインポートされた GuardDuty の所見をトリガーに、
-  対象の EC2 または ECS (Fargate) インスタンスに紐づくセキュリティグループの
-  ingress/egress ルールを削除する Step Functions 状態マシンを作成します.
-  Fargate 分岐では、タスクの Group フィールドからサービス名を抽出し、
-  ECS DescribeServices API によりサービスに紐づくセキュリティグループを動的に取得して
-  revoke を実施します.
+  このテンプレートは、Security Hub にインポートされた GuardDuty の所見（Security Hub 経由）をトリガーに、
+  対象の EC2 または ECS (Fargate) インスタンスに紐づくセキュリティグループの ingress/egress ルールを削除する仕組みを作成します。
+  EC2の場合は Lambda 関数 (SecurityGroupRevokerFunctionEC2) が、Fargateの場合は Lambda 関数 (SecurityGroupRevokerFunctionFargate) が実行されます。
+
+Parameters:
+  UpdateToken:
+    Type: String
+    Default: "initial"
+    Description: "Dummy parameter to force stack update"
 
 Resources:
 
-  StepFunctionsExecutionRole:
+  ## Step Functions 用実行ロール
+  SecurityGroupRevokerSFRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "StepFunctionsExecutionRole-${AWS::StackName}"
+      RoleName: !Sub "SecurityGroupRevokerSFRole-${AWS::StackName}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
-              Service:
+              Service: 
                 - states.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: StepFunctionsServiceIntegrationPolicy
+        - PolicyName: "SecurityGroupRevokerSFPolicy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -36,15 +40,242 @@ Resources:
                   - ecs:DescribeTasks
                   - ecs:DescribeServices
                 Resource: "*"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt SecurityGroupRevokerFunctionFargate.Arn
+                  - !GetAtt SecurityGroupRevokerFunctionEC2.Arn
 
-  SecurityGroupRevocationStateMachine:
+  ## Lambda 用実行ロール（Fargate用）
+  SecurityGroupRevokerLambdaRoleFargate:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "SecurityGroupRevokerLambdaRoleFargate-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "SecurityGroupRevokerLambdaPolicyFargate"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTasks
+                  - ecs:DescribeServices
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                Resource: "*"
+
+  ## Lambda 用実行ロール（EC2用）
+  SecurityGroupRevokerLambdaRoleEC2:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "SecurityGroupRevokerLambdaRoleEC2-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "SecurityGroupRevokerLambdaPolicyEC2"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                Resource: "*"
+
+  ## Lambda 関数 (Fargate 用)
+  SecurityGroupRevokerFunctionFargate:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "SecurityGroupRevokerFunctionFargate-${AWS::StackName}"
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityGroupRevokerLambdaRoleFargate.Arn
+      Runtime: python3.8
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3, logging, re
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ecs = boto3.client('ecs')
+          ec2 = boto3.client('ec2')
+          def lambda_handler(event, context):
+              logger.info("Event received: %s", event)
+              try:
+                  resources = event["detail"]["findings"][0]["Resources"]
+                  cluster_resource = next((r for r in resources if r["Type"] == "AwsEcsCluster"), None)
+                  task_resource = next((r for r in resources if r["Type"] == "AwsEcsTask"), None)
+                  if not cluster_resource or not task_resource:
+                      raise Exception("Required ECS resources not found in event")
+                  cluster_arn = cluster_resource["Details"]["AwsEcsCluster"]["ClusterArn"]
+                  task_arn = task_resource["Id"]
+                  task_response = ecs.describe_tasks(cluster=cluster_arn, tasks=[task_arn])
+                  tasks = task_response.get('tasks', [])
+                  if not tasks:
+                      raise Exception(f"No task found for ARN: {task_arn}")
+                  task = tasks[0]
+                  group = task.get('group', '')
+                  m = re.match(r"service:(.+)", group)
+                  if not m:
+                      raise Exception(f"Task is not associated with a service. group: {group}")
+                  service_name = m.group(1)
+                  logger.info(f"Extracted service name: {service_name}")
+                  service_response = ecs.describe_services(cluster=cluster_arn, services=[service_name])
+                  services = service_response.get('services', [])
+                  if not services:
+                      raise Exception(f"No service found with name: {service_name}")
+                  service = services[0]
+                  awsvpc_config = service.get('networkConfiguration', {}).get('awsvpcConfiguration', {})
+                  security_groups = awsvpc_config.get('securityGroups', [])
+                  if not security_groups:
+                      raise Exception("No security groups found in the service's network configuration.")
+                  logger.info(f"Security groups obtained: {security_groups}")
+                  revoked_groups = []
+                  for sg in security_groups:
+                      sg_response = ec2.describe_security_groups(GroupIds=[sg])
+                      if not sg_response['SecurityGroups']:
+                          logger.warning(f"No details found for SG {sg}")
+                          continue
+                      sg_details = sg_response['SecurityGroups'][0]
+                      ingress = sg_details.get('IpPermissions', [])
+                      egress = sg_details.get('IpPermissionsEgress', [])
+                      if ingress:
+                          try:
+                              ec2.revoke_security_group_ingress(GroupId=sg, IpPermissions=ingress)
+                              logger.info(f"Revoked ingress for {sg}")
+                          except ClientError as e:
+                              if e.response['Error']['Code'] == "InvalidPermission.NotFound":
+                                  logger.info(f"Ingress rules for {sg} already removed.")
+                              else:
+                                  raise e
+                      if egress:
+                          try:
+                              ec2.revoke_security_group_egress(GroupId=sg, IpPermissions=egress)
+                              logger.info(f"Revoked egress for {sg}")
+                          except ClientError as e:
+                              if e.response['Error']['Code'] == "InvalidPermission.NotFound":
+                                  logger.info(f"Egress rules for {sg} already removed.")
+                              else:
+                                  raise e
+                      revoked_groups.append(sg)
+              except Exception as e:
+                  logger.error(f"Error processing Fargate event: {e}")
+                  raise e
+              return { 'statusCode': 200, 'body': f"Revoked SGs: {', '.join(revoked_groups)}" }
+  
+  ## Lambda 関数 (EC2 用)
+  SecurityGroupRevokerFunctionEC2:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "SecurityGroupRevokerFunctionEC2-${AWS::StackName}"
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityGroupRevokerLambdaRoleEC2.Arn
+      Runtime: python3.8
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3, logging
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2 = boto3.client("ec2")
+          def lambda_handler(event, context):
+              try:
+                  resources = event["detail"]["findings"][0]["Resources"]
+                  instance_resource = next((r for r in resources if r["Type"] == "AwsEc2Instance"), None)
+                  if not instance_resource:
+                      raise Exception("No AwsEc2Instance resource found in event")
+                  instance_id = instance_resource["Id"].split("/")[-1]
+                  logger.info(f"Instance ID: {instance_id}")
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  reservations = response.get("Reservations", [])
+                  if not reservations or not reservations[0].get("Instances"):
+                      raise Exception(f"No instance details for {instance_id}")
+                  instance = reservations[0]["Instances"][0]
+                  security_groups = [sg["GroupId"] for sg in instance.get("SecurityGroups", [])]
+                  if not security_groups:
+                      raise Exception(f"No security groups found for instance {instance_id}")
+                  logger.info(f"Security groups for instance {instance_id}: {security_groups}")
+                  revoked = []
+                  for sg in security_groups:
+                      sg_response = ec2.describe_security_groups(GroupIds=[sg])
+                      if not sg_response["SecurityGroups"]:
+                          logger.warning(f"No details for SG {sg}")
+                          continue
+                      sg_details = sg_response["SecurityGroups"][0]
+                      ingress = sg_details.get("IpPermissions", [])
+                      egress = sg_details.get("IpPermissionsEgress", [])
+                      if ingress:
+                          try:
+                              ec2.revoke_security_group_ingress(GroupId=sg, IpPermissions=ingress)
+                              logger.info(f"Revoked ingress for {sg}")
+                          except ClientError as e:
+                              if e.response['Error']['Code'] == "InvalidPermission.NotFound":
+                                  logger.info(f"Ingress for {sg} already removed.")
+                              else:
+                                  raise e
+                      if egress:
+                          try:
+                              ec2.revoke_security_group_egress(GroupId=sg, IpPermissions=egress)
+                              logger.info(f"Revoked egress for {sg}")
+                          except ClientError as e:
+                              if e.response['Error']['Code'] == "InvalidPermission.NotFound":
+                                  logger.info(f"Egress for {sg} already removed.")
+                              else:
+                                  raise e
+                      revoked.append(sg)
+                  return { "statusCode": 200, "body": f"Revoked SGs: {', '.join(revoked)}" }
+              except Exception as e:
+                  logger.error(f"Error: {e}")
+                  raise e
+  
+  ## Lambda::Permission リソース
+  SecurityGroupRevokerFunctionFargateInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SecurityGroupRevokerFunctionFargate.Arn
+      Action: lambda:InvokeFunction
+      Principal: states.amazonaws.com
+      SourceArn: !GetAtt SecurityGroupRevokerStateMachine.Arn
+  
+  SecurityGroupRevokerFunctionEC2InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SecurityGroupRevokerFunctionEC2.Arn
+      Action: lambda:InvokeFunction
+      Principal: states.amazonaws.com
+      SourceArn: !GetAtt SecurityGroupRevokerStateMachine.Arn
+  
+  ## Step Functions 状態マシン
+  SecurityGroupRevokerStateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
-      StateMachineName: SecurityGroupRevocationStateMachine
-      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      StateMachineName: SecurityGroupRevokerStateMachine
+      RoleArn: !GetAtt SecurityGroupRevokerSFRole.Arn
       DefinitionString: !Sub |
         {
-          "Comment": "Revoke security group rules for EC2 and Fargate tasks based on Security Hub findings",
+          "Comment": "State machine to revoke security group rules for EC2 and Fargate tasks",
           "StartAt": "CheckResourceType",
           "States": {
             "CheckResourceType": {
@@ -53,17 +284,17 @@ Resources:
                 {
                   "Variable": "$.detail.findings[0].Resources[0].Type",
                   "StringEquals": "AwsEc2Instance",
-                  "Next": "EC2_DescribeInstance"
+                  "Next": "InvokeEC2Revoker"
                 },
                 {
                   "Variable": "$.detail.findings[0].Resources[0].Type",
                   "StringEquals": "AwsEcsTask",
-                  "Next": "Fargate_SelectTask"
+                  "Next": "InvokeFargateRevoker"
                 },
                 {
                   "Variable": "$.detail.findings[0].Resources[1].Type",
                   "StringEquals": "AwsEcsTask",
-                  "Next": "Fargate_SelectTask"
+                  "Next": "InvokeFargateRevoker"
                 }
               ],
               "Default": "UnsupportedResource"
@@ -71,270 +302,39 @@ Resources:
             "UnsupportedResource": {
               "Type": "Fail",
               "Error": "UnsupportedResourceType",
-              "Cause": "The resource type is not supported."
+              "Cause": "Resource type not supported."
             },
-
-            "EC2_DescribeInstance": {
+            "InvokeEC2Revoker": {
               "Type": "Task",
-              "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
+              "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "InstanceIds.$": "States.Array(States.ArrayGetItem(States.StringSplit($.detail.findings[0].Resources[0].Id, '/'), 1))"
+                "FunctionName": "${SecurityGroupRevokerFunctionEC2.Arn}",
+                "Payload.$": "$"
               },
-              "ResultPath": "$.EC2Instance",
-              "Next": "EC2_ExtractSG"
+              "ResultPath": "$.lambdaResult",
+              "Next": "SucceedState"
             },
-            "EC2_ExtractSG": {
-              "Type": "Pass",
-              "Parameters": {
-                "securityGroupObjects.$": "$.EC2Instance.Reservations[0].Instances[0].SecurityGroups"
-              },
-              "ResultPath": "$.extractedSG",
-              "Next": "EC2_ProcessSG"
-            },
-            "EC2_ProcessSG": {
-              "Type": "Map",
-              "ItemsPath": "$.extractedSG.securityGroupObjects",
-              "ResultPath": "$.EC2_SG_Results",
-              "Iterator": {
-                "StartAt": "EC2_TransformItem",
-                "States": {
-                  "EC2_TransformItem": {
-                    "Type": "Pass",
-                    "Parameters": {
-                      "groupId.$": "$.GroupId"
-                    },
-                    "ResultPath": "$",
-                    "Next": "EC2_SG_Describe"
-                  },
-                  "EC2_SG_Describe": {
-                    "Type": "Task",
-                    "Resource": "arn:aws:states:::aws-sdk:ec2:describeSecurityGroups",
-                    "Parameters": {
-                      "GroupIds.$": "States.Array($.groupId)"
-                    },
-                    "ResultPath": "$.SGDetails",
-                    "Next": "EC2_SG_RevokeParallel"
-                  },
-                  "EC2_SG_RevokeParallel": {
-                    "Type": "Parallel",
-                    "Branches": [
-                      {
-                        "StartAt": "EC2_CheckIngress",
-                        "States": {
-                          "EC2_CheckIngress": {
-                            "Type": "Choice",
-                            "Choices": [
-                              {
-                                "Variable": "$.SGDetails.SecurityGroups[0].IpPermissions[0].IpProtocol",
-                                "IsPresent": true,
-                                "Next": "EC2_RevokeIngress"
-                              }
-                            ],
-                            "Default": "EC2_SkipIngress"
-                          },
-                          "EC2_RevokeIngress": {
-                            "Type": "Task",
-                            "Resource": "arn:aws:states:::aws-sdk:ec2:revokeSecurityGroupIngress",
-                            "Parameters": {
-                              "GroupId.$": "$.groupId",
-                              "IpPermissions.$": "$.SGDetails.SecurityGroups[0].IpPermissions"
-                            },
-                            "End": true
-                          },
-                          "EC2_SkipIngress": {
-                            "Type": "Pass",
-                            "End": true
-                          }
-                        }
-                      },
-                      {
-                        "StartAt": "EC2_CheckEgress",
-                        "States": {
-                          "EC2_CheckEgress": {
-                            "Type": "Choice",
-                            "Choices": [
-                              {
-                                "Variable": "$.SGDetails.SecurityGroups[0].IpPermissionsEgress[0].IpProtocol",
-                                "IsPresent": true,
-                                "Next": "EC2_RevokeEgress"
-                              }
-                            ],
-                            "Default": "EC2_SkipEgress"
-                          },
-                          "EC2_RevokeEgress": {
-                            "Type": "Task",
-                            "Resource": "arn:aws:states:::aws-sdk:ec2:revokeSecurityGroupEgress",
-                            "Parameters": {
-                              "GroupId.$": "$.groupid",
-                              "IpPermissions.$": "$.SGDetails.SecurityGroups[0].IpPermissionsEgress"
-                            },
-                            "End": true
-                          },
-                          "EC2_SkipEgress": {
-                            "Type": "Pass",
-                            "End": true
-                          }
-                        }
-                      }
-                    ],
-                    "End": true
-                  }
-                }
-              },
-              "Next": "EC2_Done"
-            },
-            "EC2_Done": {
-              "Type": "Succeed"
-            },
-
-            "Fargate_SelectTask": {
-              "Type": "Pass",
-              "Parameters": {
-                "ClusterArn.$": "$.detail.findings[0].Resources[0].Details.AwsEcsCluster.ClusterArn",
-                "TaskId.$": "$.detail.findings[0].Resources[1].Id"
-              },
-              "ResultPath": "$.selectedTask",
-              "Next": "Fargate_DescribeTask"
-            },
-            "Fargate_DescribeTask": {
+            "InvokeFargateRevoker": {
               "Type": "Task",
-              "Resource": "arn:aws:states:::aws-sdk:ecs:describeTasks",
+              "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "Cluster.$": "$.selectedTask.ClusterArn",
-                "Tasks.$": "States.Array($.selectedTask.TaskId)"
+                "FunctionName": "${SecurityGroupRevokerFunctionFargate.Arn}",
+                "Payload.$": "$"
               },
-              "ResultPath": "$.FargateTask",
-              "Next": "Fargate_ExtractServiceName"
+              "ResultPath": "$.lambdaResult",
+              "Next": "SucceedState"
             },
-            "Fargate_ExtractServiceName": {
-              "Type": "Pass",
-              "Parameters": {
-                "serviceName.$": "States.ArrayGetItem(States.StringSplit($.FargateTask.Tasks[0].Group, ':'), 1)",
-                "ClusterArn.$": "$.selectedTask.ClusterArn"
-              },
-              "ResultPath": "$.extractedService",
-              "Next": "Fargate_DescribeService"
-            },
-            "Fargate_DescribeService": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::aws-sdk:ecs:describeServices",
-              "Parameters": {
-                "Cluster.$": "$.extractedService.ClusterArn",
-                "Services.$": "States.Array($.extractedService.serviceName)"
-              },
-              "ResultPath": "$.serviceDetails",
-              "Next": "Fargate_ExtractServiceSG"
-            },
-            "Fargate_ExtractServiceSG": {
-              "Type": "Pass",
-              "Parameters": {
-                "securityGroupObjects.$": "$.serviceDetails.services[0].networkConfiguration.awsvpcConfiguration.securityGroups"
-              },
-              "ResultPath": "$.extractedSG",
-              "Next": "Fargate_ProcessSG"
-            },
-            "Fargate_ProcessSG": {
-              "Type": "Map",
-              "ItemsPath": "$.extractedSG",
-              "ResultPath": "$.Fargate_SG_Results",
-              "Iterator": {
-                "StartAt": "Fargate_TransformItem",
-                "States": {
-                  "Fargate_TransformItem": {
-                    "Type": "Pass",
-                    "Parameters": {
-                      "groupId.$": "$$.Map.Item.Value"
-                    },
-                    "ResultPath": "$",
-                    "Next": "Fargate_SG_Describe"
-                  },
-                  "Fargate_SG_Describe": {
-                    "Type": "Task",
-                    "Resource": "arn:aws:states:::aws-sdk:ec2:describeSecurityGroups",
-                    "Parameters": {
-                      "GroupIds.$": "States.Array($.groupId)"
-                    },
-                    "ResultPath": "$.SGDetails",
-                    "Next": "Fargate_SG_RevokeParallel"
-                  },
-                  "Fargate_SG_RevokeParallel": {
-                    "Type": "Parallel",
-                    "Branches": [
-                      {
-                        "StartAt": "Fargate_CheckIngress",
-                        "States": {
-                          "Fargate_CheckIngress": {
-                            "Type": "Choice",
-                            "Choices": [
-                              {
-                                "Variable": "$.SGDetails.SecurityGroups[0].IpPermissions[0].IpProtocol",
-                                "IsPresent": true,
-                                "Next": "Fargate_RevokeIngress"
-                              }
-                            ],
-                            "Default": "Fargate_SkipIngress"
-                          },
-                          "Fargate_RevokeIngress": {
-                            "Type": "Task",
-                            "Resource": "arn:aws:states:::aws-sdk:ec2:revokeSecurityGroupIngress",
-                            "Parameters": {
-                              "GroupId.$": "$.groupid",
-                              "IpPermissions.$": "$.SGDetails.SecurityGroups[0].IpPermissions"
-                            },
-                            "End": true
-                          },
-                          "Fargate_SkipIngress": {
-                            "Type": "Pass",
-                            "End": true
-                          }
-                        }
-                      },
-                      {
-                        "StartAt": "Fargate_CheckEgress",
-                        "States": {
-                          "Fargate_CheckEgress": {
-                            "Type": "Choice",
-                            "Choices": [
-                              {
-                                "Variable": "$.SGDetails.SecurityGroups[0].IpPermissionsEgress[0].IpProtocol",
-                                "IsPresent": true,
-                                "Next": "Fargate_RevokeEgress"
-                              }
-                            ],
-                            "Default": "Fargate_SkipEgress"
-                          },
-                          "Fargate_RevokeEgress": {
-                            "Type": "Task",
-                            "Resource": "arn:aws:states:::aws-sdk:ec2:revokeSecurityGroupEgress",
-                            "Parameters": {
-                              "GroupId.$": "$.groupid",
-                              "IpPermissions.$": "$.SGDetails.SecurityGroups[0].IpPermissionsEgress"
-                            },
-                            "End": true
-                          },
-                          "Fargate_SkipEgress": {
-                            "Type": "Pass",
-                            "End": true
-                          }
-                        }
-                      }
-                    ],
-                    "End": true
-                  }
-                }
-              },
-              "Next": "Fargate_Done"
-            },
-            "Fargate_Done": {
+            "SucceedState": {
               "Type": "Succeed"
             }
           }
         }
   
-  EventBridgeStepFunctionsRole:
+  ## EventBridge 用ロール
+  SecurityGroupRevokerEBRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "EventBridgeStepFunctionsRole-${AWS::StackName}"
+      RoleName: !Sub "SecurityGroupRevokerEBRole-${AWS::StackName}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -344,15 +344,16 @@ Resources:
                 - events.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: "AllowStartExecution"
+        - PolicyName: "EBPolicy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
                   - states:StartExecution
-                Resource: !GetAtt SecurityGroupRevocationStateMachine.Arn
+                Resource: !GetAtt SecurityGroupRevokerStateMachine.Arn
   
+  ## Security Hub イベントルール
   SecurityHubEventRule:
     Type: AWS::Events::Rule
     Properties:
@@ -369,17 +370,29 @@ Resources:
                 - "CRITICAL"
                 - "HIGH"
       Targets:
-        - Arn: !GetAtt SecurityGroupRevocationStateMachine.Arn
+        - Arn: !GetAtt SecurityGroupRevokerStateMachine.Arn
           Id: "TargetStateMachine"
-          RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
+          RoleArn: !GetAtt SecurityGroupRevokerEBRole.Arn
 
 Outputs:
-  SecurityGroupRevocationStateMachineArn:
+  SecurityGroupRevokerStateMachineArn:
     Description: "ARN of the Step Functions State Machine"
-    Value: !Ref SecurityGroupRevocationStateMachine
-  SecurityGroupRevocationStateMachineName:
+    Value: !Ref SecurityGroupRevokerStateMachine
+  SecurityGroupRevokerStateMachineName:
     Description: "Name of the Step Functions State Machine"
-    Value: !Ref SecurityGroupRevocationStateMachine
-  EventBridgeStepFunctionsRoleArn:
-    Description: "ARN of the IAM Role for EventBridge to start the state machine"
-    Value: !GetAtt EventBridgeStepFunctionsRole.Arn
+    Value: !Ref SecurityGroupRevokerStateMachine
+  SecurityGroupRevokerEBRoleArn:
+    Description: "ARN of the IAM Role for EventBridge"
+    Value: !GetAtt SecurityGroupRevokerEBRole.Arn
+  SecurityGroupRevokerFunctionFargateArn:
+    Description: "ARN of the Lambda function for Fargate"
+    Value: !GetAtt SecurityGroupRevokerFunctionFargate.Arn
+  SecurityGroupRevokerFunctionEC2Arn:
+    Description: "ARN of the Lambda function for EC2"
+    Value: !GetAtt SecurityGroupRevokerFunctionEC2.Arn
+  EcsLambdaRoleArn:
+    Description: "ARN of the Lambda execution role for Fargate"
+    Value: !GetAtt SecurityGroupRevokerLambdaRoleFargate.Arn
+  EC2LambdaRoleArn:
+    Description: "ARN of the Lambda execution role for EC2"
+    Value: !GetAtt SecurityGroupRevokerLambdaRoleEC2.Arn
