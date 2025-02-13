@@ -5,12 +5,12 @@
 ## ワークフロー図
 ```mermaid
 flowchart TD
-    A["DBにIP記録\n(Lambda：レコード関数)"]
+    A["DBにIP記録<br>(Lambda：レコード関数)"]
     B{"新規IPか？"}
-    C["ファイアウォール更新\n(Lambda：ルール更新)"]
-    D["成功通知\n(SNS発行)"]
+    C["ファイアウォール更新<br>(Lambda：ルール更新)"]
+    D["成功通知<br>(SNS発行)"]
     E["変更なし"]
-    F["失敗通知\n(SNS発行)"]
+    F["失敗通知<br>(SNS発行)"]
 
     A --> B
     B -- "はい" --> C

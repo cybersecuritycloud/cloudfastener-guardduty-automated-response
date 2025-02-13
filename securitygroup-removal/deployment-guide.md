@@ -7,14 +7,13 @@
 
 ```mermaid
 flowchart TD
-    A["Security Hub イベント\n(GuardDuty 所見：CRITICAL / HIGH)"]
-    B["EventBridge ルール\n(イベント検出)"]
-    C["Step Functions 状態マシン\n(SecurityGroupRevokerStateMachine)"]
+    A["Security Hub イベント<br>(GuardDuty 所見：CRITICAL / HIGH)"]
+    B["EventBridge ルール<br>(イベント検出)"]
+    C["Step Functions 状態マシン<br>(SecurityGroupRevokerStateMachine)"]
     D{"リソースタイプ判定"}
-    E["EC2 用 Lambda\n(SecurityGroupRevokerFunctionEC2)"]
-    F["Fargate 用 Lambda\n(SecurityGroupRevokerFunctionFargate)"]
-    G["セキュリティグループの\nルール削除処理"]
-    H["SNS 通知\n(成功/失敗)"]
+    E["EC2 用 Lambda<br>(SecurityGroupRevokerFunctionEC2)"]
+    F["Fargate 用 Lambda<br>(SecurityGroupRevokerFunctionFargate)"]
+    G["セキュリティグループの<br>ルール削除処理"]
 
     A --> B
     B --> C
@@ -23,7 +22,6 @@ flowchart TD
     D -- "AwsEcsTask" --> F
     E --> G
     F --> G
-    G --> H
 
 ```
 
