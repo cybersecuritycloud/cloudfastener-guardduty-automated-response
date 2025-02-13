@@ -28,26 +28,8 @@
 各ディレクトリにある `deployment-guide.md` を参照してください。
 
 ## アーキテクチャ図
-```mermaid
-flowchart TD
-    A["Security Hub (GuardDuty Findings)"]
-    B["EventBridge Rule"]
-    C["Step Functions State Machine"]
-    D{"Resource Type?"}
-    E["SecurityGroupRevokerFunctionEC2 (Lambda)"]
-    F["SecurityGroupRevokerFunctionFargate (Lambda)"]
-    G["EC2/ECS API: Describe & Revoke SG Rules"]
 
-    A --> B
-    B --> C
-    C --> D
-    D -- "AwsEc2Instance" --> E
-    D -- "AwsEcsTask" --> F
-    E --> G
-    F --> G
-
-
-```
+![alt text](aws-automated-responce.drawio.png)
 
 ```
 
